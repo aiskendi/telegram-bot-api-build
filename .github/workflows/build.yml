@@ -51,7 +51,7 @@ jobs:
             build-essential cmake gperf git zlib1g-dev libssl-dev ca-certificates
 
       - name: Checkout upstream at pinned commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: tdlib/telegram-bot-api
           ref: ${{ steps.ref.outputs.ref }}
@@ -67,15 +67,24 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "short=${SHA:0:7}" >> "$GITHUB_OUTPUT"
 
-      - name: Add swap headroom
+      - name: Ensure swap headroom
         # A handful of TDLib translation units (td_api.cpp, TelegramClient.cpp)
         # need ~2GB each. Four in parallel has OOM-killed builds on 16GB runners.
+        # Hosted runners usually already have an active /swapfile — touching it
+        # fails with "Text file busy", so only add one when none is present.
         run: |
           set -euo pipefail
-          sudo fallocate -l 6G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=6144
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          free -m
+          if ! swapon --show | grep -q .; then
+            echo "no swap active, adding 6G"
+            sudo fallocate -l 6G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=6144
+            sudo chmod 600 /swapfile
+            sudo mkswap /swapfile
+            sudo swapon /swapfile
+          else
+            echo "swap already active, leaving it alone"
+            swapon --show
+          fi
           free -m
 
       - name: Configure
