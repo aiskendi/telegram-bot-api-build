@@ -1,0 +1,149 @@
+name: build-telegram-bot-api
+
+# Builds tdlib/telegram-bot-api from a PINNED commit and publishes the binary
+# as a release asset. Never builds a floating branch.
+#
+#   Default pin: 5df614c91dab8662cfbb24a501ec89949fdcfebb  ("Update version to 10.5.")
+
+on:
+  workflow_dispatch:
+    inputs:
+      tdlib_ref:
+        description: "tdlib/telegram-bot-api commit SHA to build (blank = pinned default)"
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build.yml"
+  schedule:
+    # Monthly rebuild so the artefact does not rot against Ubuntu security updates.
+    - cron: "0 4 1 * *"
+
+permissions:
+  contents: write
+
+env:
+  PINNED_TDLIB_SHA: 5df614c91dab8662cfbb24a501ec89949fdcfebb
+
+jobs:
+  build:
+    # Pinned to 24.04 so the binary links glibc 2.39, matching the target box.
+    # ubuntu-latest would silently become 26.04 (glibc 2.41) and break older hosts.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - name: Resolve ref
+        id: ref
+        run: |
+          set -euo pipefail
+          REF="${{ inputs.tdlib_ref }}"
+          REF="${REF:-$PINNED_TDLIB_SHA}"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "Building tdlib/telegram-bot-api @ ${REF}"
+          echo "runner: $(nproc) cores, $(free -m | awk '/Mem:/{print $2}')MB RAM"
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake gperf git zlib1g-dev libssl-dev ca-certificates
+
+      - name: Checkout upstream at pinned commit
+        uses: actions/checkout@v4
+        with:
+          repository: tdlib/telegram-bot-api
+          ref: ${{ steps.ref.outputs.ref }}
+          submodules: recursive
+          path: src
+          fetch-depth: 0
+
+      - name: Record resolved commit
+        id: meta
+        run: |
+          set -euo pipefail
+          SHA="$(git -C src rev-parse HEAD)"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short=${SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Add swap headroom
+        # A handful of TDLib translation units (td_api.cpp, TelegramClient.cpp)
+        # need ~2GB each. Four in parallel has OOM-killed builds on 16GB runners.
+        run: |
+          set -euo pipefail
+          sudo fallocate -l 6G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=6144
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -m
+
+      - name: Configure
+        working-directory: src
+        run: |
+          set -euo pipefail
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX:PATH="$GITHUB_WORKSPACE/install"
+
+      - name: Build
+        working-directory: src
+        run: cmake --build build --target install -- -j"$(nproc)"
+
+      - name: Verify version
+        id: verify
+        run: |
+          set -euo pipefail
+          BIN="$GITHUB_WORKSPACE/install/bin/telegram-bot-api"
+          test -x "$BIN" || { echo "binary missing"; exit 1; }
+          OUT="$("$BIN" --version 2>&1 || true)"
+          echo "reported: $OUT"
+          VER="$(sed -n 's/.*Bot API \([0-9][0-9.]*\).*/\1/p' <<< "$OUT" | head -1)"
+          test -n "$VER" || { echo "could not parse Bot API version"; exit 1; }
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          echo "Bot API version: $VER"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          VER="${{ steps.verify.outputs.ver }}"
+          mkdir -p dist
+          install -m 0755 install/bin/telegram-bot-api dist/telegram-bot-api
+          {
+            echo "tdlib/telegram-bot-api"
+            echo "bot_api_version: $VER"
+            echo "commit: ${{ steps.meta.outputs.sha }}"
+            echo "built_at_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "runner: ubuntu-24.04"
+            echo "libc: $(ldd --version | head -1)"
+            echo "compiler: $(g++ --version | head -1)"
+          } > dist/BUILD-INFO.txt
+          tar -C dist -czf "dist/telegram-bot-api-${VER}-linux-x86_64.tar.gz" telegram-bot-api BUILD-INFO.txt
+          ( cd dist && sha256sum telegram-bot-api *.tar.gz BUILD-INFO.txt > SHA256SUMS && cat SHA256SUMS )
+          ls -lh dist
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: tdlib-${{ steps.verify.outputs.ver }}-${{ steps.meta.outputs.short }}
+        run: |
+          set -euo pipefail
+          TITLE="tdlib ${{ steps.verify.outputs.ver }} (${TAG##*-})"
+          NOTES="$(cat dist/BUILD-INFO.txt)"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/telegram-bot-api dist/*.tar.gz dist/SHA256SUMS dist/BUILD-INFO.txt \
+              --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" \
+              dist/telegram-bot-api dist/*.tar.gz dist/SHA256SUMS dist/BUILD-INFO.txt \
+              --repo "$GITHUB_REPOSITORY" --title "$TITLE" --notes "$NOTES"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "sha256=$(grep ' telegram-bot-api$' dist/SHA256SUMS | cut -d' ' -f1)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload workflow artefact
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-bot-api-${{ steps.verify.outputs.ver }}-${{ steps.meta.outputs.short }}
+          path: dist/
+          retention-days: 14
